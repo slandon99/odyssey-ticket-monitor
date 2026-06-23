@@ -155,9 +155,48 @@ def run():
     newly_sent = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
+        try:
+            browser = p.chromium.launch(
+                channel="chrome",
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        except Exception:
+            # Falls back to the bundled browser if the real Chrome
+            # channel was not installed on this runner.
+            browser = p.chromium.launch(
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+        page = context.new_page()
         page.goto(THEATRE_URL, wait_until="networkidle", timeout=60000)
+
+        # Try to dismiss the cookie consent banner, since some sites pause
+        # their main content scripts until it is closed. This is wrapped
+        # in a try block because the banner might not always appear.
+        try:
+            page.get_by_role(
+                "button", name=re.compile("accept|agree|close", re.I)
+            ).first.click(timeout=5000)
+        except Exception:
+            pass
+
+        # Give the showtimes widget real time to load real content instead
+        # of guessing a fixed delay. Falls through either way so debug
+        # files still get written if this never appears.
+        try:
+            page.wait_for_selector("text=/imax/i", timeout=15000)
+        except Exception:
+            pass
+
         page.wait_for_timeout(3000)
 
         # Always save debug info so we can check what the page actually
