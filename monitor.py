@@ -2,27 +2,28 @@
 Odyssey IMAX ticket monitor for AMC Lincoln Square 13.
 
 What this does, in plain terms:
-1. Opens the AMC showtimes page in a real headless browser (Playwright),
-   so JavaScript loaded content actually shows up, unlike a plain
-   requests.get call.
-2. Looks at the date tabs on that page and only clicks into the ones
-   that match a date you actually care about (see TIME_WINDOWS below).
-3. On each matching date, scans the rendered text for "Odyssey" and
-   checks whether an IMAX showtime is listed under it.
-4. Compares any IMAX showtime found against your time window rule for
+1. Opens Fandango's page for this theater in a real browser (Playwright),
+   once per date you care about, using a date parameter directly in the
+   URL. This replaced an earlier version that tried AMC's own site,
+   which got stuck loading and never showed real showtime data for an
+   automated browser.
+2. On each date's page, scans the rendered text for "Odyssey" and checks
+   whether an IMAX showtime is listed near it.
+3. Compares any IMAX showtime found against your time window rule for
    that date.
-5. Sends one Telegram alert per matching showtime, only once ever,
+4. Sends one Telegram alert per matching showtime, only once ever,
    using seen_showtimes.json to remember what has already been sent.
-6. Always saves a screenshot and the full rendered page text as debug
-   files, so if the parsing logic is wrong, we can see exactly what the
-   real page looked like and fix it quickly.
+5. Always saves a screenshot from the first date checked and the full
+   rendered page text for every date, as debug files, so if the parsing
+   logic is wrong, we can see exactly what the real page looked like and
+   fix it quickly.
 
 Known limitation: the part of this script that finds "Odyssey" and
 "IMAX" text on the page (see find_matches below) was written without
-being able to load the real AMC page directly. It is a reasonable best
-attempt, not something already confirmed against the live site. Check
-the debug_page_text.txt artifact after the first real run. If nothing
-matches when it should, that file will show why.
+being able to load the real Fandango page directly. It is a reasonable
+best attempt, not something already confirmed against the live site.
+Check the debug_page_text.txt artifact after the first real run. If
+nothing matches when it should, that file will show why.
 """
 
 import json
@@ -34,17 +35,12 @@ from playwright.sync_api import sync_playwright
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-THEATRE_URL = "https://www.amctheatres.com/movie-theatres/new-york-city/amc-lincoln-square-13/showtimes/all"
+THEATRE_URL_TEMPLATE = "https://www.fandango.com/amc-lincoln-square-13-aabqi/theater-page?date={date}&a=11533"
 
 MOVIE_KEYWORD = "odyssey"
 FORMAT_KEYWORDS = ["imax", "dolby cinema", "standard", "real d 3d", "prime", "dine-in"]
 
 SEEN_FILE = "seen_showtimes.json"
-
-MONTH_MAP = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-}
 
 # Date in YYYY-MM-DD format, mapped to the earliest allowed hour (24 hour
 # clock) for that date, or None meaning any time of day is fine.
@@ -83,20 +79,6 @@ def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     response = requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=15)
     response.raise_for_status()
-
-
-def guess_date_from_label(label):
-    """Turn a date tab label like 'Thu Jul 16' into '2026-07-16'."""
-    match = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2})", label)
-    if not match:
-        return None
-    month_text, day_text = match.groups()
-    month_key = month_text.lower()[:3]
-    if month_key not in MONTH_MAP:
-        return None
-    month = MONTH_MAP[month_key]
-    day = int(day_text)
-    return f"2026-{month:02d}-{day:02d}"
 
 
 def parse_hour(time_text):
@@ -153,6 +135,7 @@ def find_matches(page_text):
 def run():
     seen = load_seen()
     newly_sent = []
+    all_debug_text = []
 
     with sync_playwright() as p:
         try:
@@ -177,58 +160,37 @@ def run():
             timezone_id="America/New_York",
         )
         page = context.new_page()
-        page.goto(THEATRE_URL, wait_until="networkidle", timeout=60000)
 
-        # Try to dismiss the cookie consent banner, since some sites pause
-        # their main content scripts until it is closed. This is wrapped
-        # in a try block because the banner might not always appear.
-        try:
-            page.get_by_role(
-                "button", name=re.compile("accept|agree|close", re.I)
-            ).first.click(timeout=5000)
-        except Exception:
-            pass
+        for index, (date, allowed_hour) in enumerate(TIME_WINDOWS.items()):
+            url = THEATRE_URL_TEMPLATE.format(date=date)
+            page.goto(url, wait_until="networkidle", timeout=60000)
 
-        # Give the showtimes widget real time to load real content instead
-        # of guessing a fixed delay. Falls through either way so debug
-        # files still get written if this never appears.
-        try:
-            page.wait_for_selector("text=/imax/i", timeout=15000)
-        except Exception:
-            pass
-
-        page.wait_for_timeout(3000)
-
-        # Always save debug info so we can check what the page actually
-        # looked like, regardless of whether anything matched.
-        page.screenshot(path="debug_screenshot.png", full_page=True)
-
-        date_tab_candidates = page.get_by_role("button")
-        tab_count = date_tab_candidates.count()
-
-        all_debug_text = []
-
-        for i in range(tab_count):
-            tab = date_tab_candidates.nth(i)
-            try:
-                tab_text = tab.inner_text(timeout=2000).strip()
-            except Exception:
-                continue
-
-            tab_date = guess_date_from_label(tab_text)
-            if tab_date is None or tab_date not in TIME_WINDOWS:
-                continue
+            # Try to dismiss the cookie consent banner, only worth trying
+            # on the first page since it usually stays dismissed after.
+            if index == 0:
+                try:
+                    page.get_by_role(
+                        "button", name=re.compile("accept|agree|close", re.I)
+                    ).first.click(timeout=5000)
+                except Exception:
+                    pass
 
             try:
-                tab.click(timeout=5000)
-                page.wait_for_timeout(2000)
+                page.wait_for_selector("text=/odyssey/i", timeout=15000)
             except Exception:
-                continue
+                pass
+
+            page.wait_for_timeout(2000)
+
+            # Only keep one screenshot, from the first date checked, so we
+            # can see whether the page rendered without using up too much
+            # space in the debug artifact.
+            if index == 0:
+                page.screenshot(path="debug_screenshot.png", full_page=True)
 
             page_text = page.inner_text("body")
-            all_debug_text.append(f"--- DATE TAB: {tab_text} ({tab_date}) ---\n{page_text}\n")
+            all_debug_text.append(f"--- DATE: {date} ---\n{page_text}\n")
 
-            allowed_hour = TIME_WINDOWS[tab_date]
             for time_text in find_matches(page_text):
                 hour = parse_hour(time_text)
                 if hour is None:
@@ -236,30 +198,23 @@ def run():
                 if allowed_hour is not None and hour < allowed_hour:
                     continue
 
-                key = f"{tab_date} {time_text}"
+                key = f"{date} {time_text}"
                 if key in seen:
                     continue
 
                 send_telegram(
                     "The Odyssey, IMAX\n"
                     f"AMC Lincoln Square 13\n"
-                    f"{tab_date} at {time_text}\n\n"
-                    f"{THEATRE_URL}"
+                    f"{date} at {time_text}\n\n"
+                    f"{url}"
                 )
                 seen.add(key)
                 newly_sent.append(key)
 
-        fallback_text = page.inner_text("body")
         browser.close()
 
-        with open("debug_page_text.txt", "w") as f:
-            if all_debug_text:
-                f.write("\n".join(all_debug_text))
-            else:
-                f.write(
-                    "No date tabs matched any of our target dates this run.\n"
-                    "Full page text below for reference:\n\n" + fallback_text
-                )
+    with open("debug_page_text.txt", "w") as f:
+        f.write("\n".join(all_debug_text))
 
     save_seen(seen)
 
