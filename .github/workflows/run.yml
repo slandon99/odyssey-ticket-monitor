@@ -1,24 +1,51 @@
-name: ticket-monitor
+name: Odyssey IMAX Ticket Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/20 * * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - run: pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
 
-      - run: python monitor.py
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+
+      - name: Run monitor
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python monitor.py
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-output
+          path: |
+            debug_screenshot.png
+            debug_page_text.txt
+          retention-days: 5
+
+      - name: Save seen showtimes back to the repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add seen_showtimes.json
+          git diff --staged --quiet || git commit -m "Update seen showtimes"
+          git push
