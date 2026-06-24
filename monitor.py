@@ -4,31 +4,31 @@ Odyssey IMAX ticket monitor for AMC Lincoln Square 13.
 What this does, in plain terms:
 1. Opens Fandango's page for this theater in a real browser (Playwright),
    once per date you care about, using a date parameter directly in the
-   URL. This replaced an earlier version that tried AMC's own site,
-   which got stuck loading and never showed real showtime data for an
-   automated browser.
-2. On each date's page, scans the rendered text for "Odyssey" and checks
-   whether an IMAX showtime is listed near it.
-3. Compares any IMAX showtime found against your time window rule for
-   that date.
-4. Sends one Telegram alert per matching showtime, only once ever,
-   using seen_showtimes.json to remember what has already been sent.
-5. Always saves a screenshot from the first date checked and the full
-   rendered page text for every date, as debug files, so if the parsing
-   logic is wrong, we can see exactly what the real page looked like and
-   fix it quickly.
+   URL.
+2. Reads the real structured showtime data that Fandango embeds in the
+   page's HTML (not just the visible text), which includes an exact
+   available or sold out status, the exact format of each showing, and
+   a direct booking link, per showtime.
+3. Keeps only showtimes that are IMAX and fall inside your time window
+   rule for that date.
+4. Sends a Telegram alert whenever a showtime transitions into being
+   available, whether that is the first time it is seen or a reopen
+   after previously selling out. A showing that stays available run
+   after run only triggers one alert, not a repeat every run.
+5. Always saves a screenshot and the full page HTML from the first date
+   checked, plus the rendered text for every date, as debug files.
 
-Known limitation: the part of this script that finds "Odyssey" and
-"IMAX" text on the page (see find_matches below) was written without
-being able to load the real Fandango page directly. It is a reasonable
-best attempt, not something already confirmed against the live site.
-Check the debug_page_text.txt artifact after the first real run. If
-nothing matches when it should, that file will show why.
+This replaced an earlier version that scanned the visible page text and
+guessed at formats and times. That version could not tell a sold out
+showtime from an available one, since that distinction is not visible
+in plain text, only in the underlying data. This version reads the real
+data directly instead of guessing.
 """
 
 import json
 import os
 import re
+import html as ihtml
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -38,7 +38,6 @@ CHAT_ID = os.environ["CHAT_ID"]
 THEATRE_URL_TEMPLATE = "https://www.fandango.com/amc-lincoln-square-13-aabqi/theater-page?date={date}&a=11533"
 
 MOVIE_KEYWORD = "odyssey"
-FORMAT_KEYWORDS = ["imax", "70mm", "dolby cinema", "standard", "real d 3d", "prime", "dine-in"]
 
 SEEN_FILE = "seen_showtimes.json"
 
@@ -66,13 +65,19 @@ TIME_WINDOWS = {
 def load_seen():
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE) as f:
-            return set(json.load(f))
-    return set()
+            data = json.load(f)
+            # Older versions of this script stored a flat list of
+            # already-alerted showtimes instead of a status per
+            # showtime. Treat that old format as a fresh start, since
+            # it has no status information to recover.
+            if isinstance(data, dict):
+                return data
+    return {}
 
 
 def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
-        json.dump(sorted(seen), f, indent=2)
+        json.dump(seen, f, indent=2, sort_keys=True)
 
 
 def send_telegram(message):
@@ -81,51 +86,94 @@ def send_telegram(message):
     response.raise_for_status()
 
 
-def parse_hour(time_text):
-    """Turn '7:40p', '7:40pm', or '7:40 PM' into an hour on a 24 hour clock."""
-    match = re.search(r"(\d{1,2}):(\d{2})\s*([ap])m?", time_text.lower())
-    if not match:
-        return None
-    hour, _minute, meridian = match.groups()
-    hour = int(hour)
-    if meridian == "p" and hour != 12:
-        hour += 12
-    if meridian == "a" and hour == 12:
-        hour = 0
-    return hour
-
-
-def find_matches(page_text):
+def extract_movie_section(page_html, keyword):
     """
-    Scan the rendered page text for IMAX showtimes of The Odyssey.
-    Returns a list of time strings found under an IMAX heading near
-    an Odyssey mention.
+    Returns the slice of the page HTML belonging to the movie whose
+    card contains the given keyword, so showtimes for some other movie
+    on the same page never get picked up by accident. Each movie sits
+    inside its own <article class="shared-movie-showtimes__movie">
+    element, immediately followed by a sibling section holding that
+    movie's showtimes, ending where the next movie's article begins.
     """
-    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
-    matches = []
+    article_token = '<article class="shared-movie-showtimes__movie"'
+    positions = [m.start() for m in re.finditer(re.escape(article_token), page_html)]
 
-    for i, line in enumerate(lines):
-        if MOVIE_KEYWORD not in line.lower():
+    for i, start in enumerate(positions):
+        end = positions[i + 1] if i + 1 < len(positions) else len(page_html)
+        section = page_html[start:end]
+        # Only need to look at the first part of the section (before the
+        # showtimes start) to check which movie this is.
+        header = section[:1500]
+        if keyword in header.lower():
+            return section
+
+    return ""
+
+
+def extract_amenity_groups(section_html):
+    """
+    Pulls out every data-amenity-group attribute in the given HTML and
+    decodes it from a JSON-as-HTML-attribute string into a real dict.
+    Each one describes one format (IMAX, Standard, and so on) and lists
+    every showtime in that format, including its real available or sold
+    out status.
+    """
+    groups = []
+    start_token = 'data-amenity-group="'
+    pos = 0
+    while True:
+        idx = section_html.find(start_token, pos)
+        if idx == -1:
+            break
+        start = idx + len(start_token)
+        end = section_html.find('"', start)
+        raw = section_html[start:end]
+        pos = end + 1
+
+        decoded = ihtml.unescape(raw)
+        try:
+            data = json.loads(decoded)
+        except json.JSONDecodeError:
             continue
+        groups.append(data)
 
-        current_format = None
-        # Look at the next 45 lines after the Odyssey title for format
-        # labels and showtime stamps, enough to cover every format
-        # section (IMAX, plain 70mm, Dolby Cinema, Standard) for one day.
-        for nearby_line in lines[i + 1: i + 46]:
-            lower = nearby_line.lower()
+    return groups
 
-            matched_format = None
-            for fmt in FORMAT_KEYWORDS:
-                if fmt in lower:
-                    matched_format = fmt
-                    break
-            if matched_format:
-                current_format = matched_format
+
+def find_matches(page_html):
+    """
+    Returns a list of dicts, one per IMAX showtime of The Odyssey found
+    in the page's embedded data, available or sold out:
+    {"time": "10:00p", "hour": 22, "url": "...", "id": "...", "status": "available"}
+    """
+    section = extract_movie_section(page_html, MOVIE_KEYWORD)
+    if not section:
+        return []
+
+    matches = []
+    for group in extract_amenity_groups(section):
+        for showtime in group.get("showtimes", []):
+            if showtime.get("expired"):
                 continue
 
-            if current_format == "imax" and re.search(r"\d{1,2}:\d{2}\s*[ap]m?\b", lower):
-                matches.append(nearby_line)
+            film_formats = [
+                fmt.get("filterName", "").lower()
+                for fmt in showtime.get("filmFormat", [])
+            ]
+            if not any("imax" in fmt for fmt in film_formats):
+                continue
+
+            ticketing_date = showtime.get("ticketingDate", "")
+            hour_match = re.search(r"\+(\d{1,2}):(\d{2})", ticketing_date)
+            hour = int(hour_match.group(1)) if hour_match else None
+
+            matches.append({
+                "time": showtime.get("date"),
+                "hour": hour,
+                "url": showtime.get("ticketingJumpPageURL"),
+                "id": showtime.get("id") or showtime.get("showtimeHashCode"),
+                "status": showtime.get("type"),
+            })
 
     return matches
 
@@ -180,36 +228,41 @@ def run():
 
             page.wait_for_timeout(2000)
 
-            # Only keep one screenshot, from the first date checked, so we
-            # can see whether the page rendered without using up too much
-            # space in the debug artifact.
+            page_html = page.content()
+
+            # Only keep one screenshot and one full HTML dump, from the
+            # first date checked, so the debug artifact stays a
+            # reasonable size.
             if index == 0:
                 page.screenshot(path="debug_screenshot.png", full_page=True)
                 with open("debug_page_html.html", "w") as f:
-                    f.write(page.content())
+                    f.write(page_html)
 
-            page_text = page.inner_text("body")
-            all_debug_text.append(f"--- DATE: {date} ---\n{page_text}\n")
+            all_debug_text.append(
+                f"--- DATE: {date} ---\n{page.inner_text('body')}\n"
+            )
 
-            for time_text in find_matches(page_text):
-                hour = parse_hour(time_text)
+            for match in find_matches(page_html):
+                hour = match["hour"]
                 if hour is None:
                     continue
                 if allowed_hour is not None and hour < allowed_hour:
                     continue
 
-                key = f"{date} {time_text}"
-                if key in seen:
-                    continue
+                key = f"{date}:{match['id']}"
+                current_status = match["status"]
+                previous_status = seen.get(key)
 
-                send_telegram(
-                    "The Odyssey, IMAX\n"
-                    f"AMC Lincoln Square 13\n"
-                    f"{date} at {time_text}\n\n"
-                    f"{url}"
-                )
-                seen.add(key)
-                newly_sent.append(key)
+                if current_status == "available" and previous_status != "available":
+                    send_telegram(
+                        "The Odyssey, IMAX, seats available\n"
+                        f"AMC Lincoln Square 13\n"
+                        f"{date} at {match['time']}\n\n"
+                        f"{match['url']}"
+                    )
+                    newly_sent.append(key)
+
+                seen[key] = current_status
 
         browser.close()
 
