@@ -230,13 +230,12 @@ def run():
 
             page_html = page.content()
 
-            # Only keep one screenshot and one full HTML dump, from the
-            # first date checked, so the debug artifact stays a
-            # reasonable size.
-            if index == 0:
-                page.screenshot(path="debug_screenshot.png", full_page=True)
-                with open("debug_page_html.html", "w") as f:
-                    f.write(page_html)
+            # Save HTML for every date while we are actively debugging
+            # specific dates, so any date in question can be inspected
+            # directly instead of guessing.
+            page.screenshot(path=f"debug_screenshot_{date}.png", full_page=True)
+            with open(f"debug_page_html_{date}.html", "w") as f:
+                f.write(page_html)
 
             all_debug_text.append(
                 f"--- DATE: {date} ---\n{page.inner_text('body')}\n"
