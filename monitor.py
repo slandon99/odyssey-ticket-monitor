@@ -185,6 +185,8 @@ def run():
             # space in the debug artifact.
             if index == 0:
                 page.screenshot(path="debug_screenshot.png", full_page=True)
+                with open("debug_page_html.html", "w") as f:
+                    f.write(page.content())
 
             page_text = page.inner_text("body")
             all_debug_text.append(f"--- DATE: {date} ---\n{page_text}\n")
