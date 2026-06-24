@@ -42,6 +42,7 @@ jobs:
           path: |
             debug_screenshot.png
             debug_page_text.txt
+            debug_page_html.html
           retention-days: 5
 
       - name: Save seen showtimes back to the repo
