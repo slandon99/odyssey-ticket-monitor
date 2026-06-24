@@ -38,7 +38,7 @@ CHAT_ID = os.environ["CHAT_ID"]
 THEATRE_URL_TEMPLATE = "https://www.fandango.com/amc-lincoln-square-13-aabqi/theater-page?date={date}&a=11533"
 
 MOVIE_KEYWORD = "odyssey"
-FORMAT_KEYWORDS = ["imax", "dolby cinema", "standard", "real d 3d", "prime", "dine-in"]
+FORMAT_KEYWORDS = ["imax", "70mm", "dolby cinema", "standard", "real d 3d", "prime", "dine-in"]
 
 SEEN_FILE = "seen_showtimes.json"
 
@@ -82,15 +82,15 @@ def send_telegram(message):
 
 
 def parse_hour(time_text):
-    """Turn '7:40pm' or '7:40 PM' into an hour on a 24 hour clock."""
-    match = re.search(r"(\d{1,2}):(\d{2})\s*([ap]m)", time_text.lower())
+    """Turn '7:40p', '7:40pm', or '7:40 PM' into an hour on a 24 hour clock."""
+    match = re.search(r"(\d{1,2}):(\d{2})\s*([ap])m?", time_text.lower())
     if not match:
         return None
     hour, _minute, meridian = match.groups()
     hour = int(hour)
-    if meridian == "pm" and hour != 12:
+    if meridian == "p" and hour != 12:
         hour += 12
-    if meridian == "am" and hour == 12:
+    if meridian == "a" and hour == 12:
         hour = 0
     return hour
 
@@ -100,9 +100,6 @@ def find_matches(page_text):
     Scan the rendered page text for IMAX showtimes of The Odyssey.
     Returns a list of time strings found under an IMAX heading near
     an Odyssey mention.
-
-    This is the part most likely to need adjusting after seeing the
-    real debug_page_text.txt output.
     """
     lines = [line.strip() for line in page_text.splitlines() if line.strip()]
     matches = []
@@ -112,9 +109,10 @@ def find_matches(page_text):
             continue
 
         current_format = None
-        # Look at the next 30 lines after the Odyssey title for format
-        # labels and showtime stamps.
-        for nearby_line in lines[i + 1: i + 31]:
+        # Look at the next 45 lines after the Odyssey title for format
+        # labels and showtime stamps, enough to cover every format
+        # section (IMAX, plain 70mm, Dolby Cinema, Standard) for one day.
+        for nearby_line in lines[i + 1: i + 46]:
             lower = nearby_line.lower()
 
             matched_format = None
@@ -126,7 +124,7 @@ def find_matches(page_text):
                 current_format = matched_format
                 continue
 
-            if current_format == "imax" and re.search(r"\d{1,2}:\d{2}\s*[ap]m", lower):
+            if current_format == "imax" and re.search(r"\d{1,2}:\d{2}\s*[ap]m?\b", lower):
                 matches.append(nearby_line)
 
     return matches
