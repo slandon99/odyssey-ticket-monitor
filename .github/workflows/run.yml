@@ -40,9 +40,9 @@ jobs:
         with:
           name: debug-output
           path: |
-            debug_screenshot.png
+            debug_screenshot_*.png
             debug_page_text.txt
-            debug_page_html.html
+            debug_page_html_*.html
           retention-days: 5
 
       - name: Save seen showtimes back to the repo
