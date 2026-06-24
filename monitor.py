@@ -163,7 +163,7 @@ def run():
 
         for index, (date, allowed_hour) in enumerate(TIME_WINDOWS.items()):
             url = THEATRE_URL_TEMPLATE.format(date=date)
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
             # Try to dismiss the cookie consent banner, only worth trying
             # on the first page since it usually stays dismissed after.
